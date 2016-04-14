@@ -89,7 +89,7 @@ def main():
         # Update
         ########
         if oc_volume.needs_update():
-            api_rval = oc_volume.put(overwrite=True)
+            api_rval = oc_volume.put()
 
             if api_rval['returncode'] != 0:
                 module.fail_json(msg=api_rval)

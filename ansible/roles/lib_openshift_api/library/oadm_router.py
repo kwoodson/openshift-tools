@@ -575,7 +575,7 @@ class Router(OpenShiftCLI):
         return parts
 
     def exists(self):
-        '''return a deploymentconfig by name '''
+        '''does the object exist?'''
         parts = self.get()
         for part in parts:
             if part['returncode'] == 0:

@@ -848,171 +848,414 @@ class DeploymentConfig(Yedit):
 
         return not all(results)
 
-# pylint: disable=too-many-instance-attributes
-class OCVolume(OpenShiftCLI):
-    ''' Class to wrap the oc command line tools '''
-    volume_mounts_path = {"pod": "spec#containers[0]#volumeMounts",
-                          "dc":  "spec#template#spec#containers[0]#volumeMounts",
-                          "rc":  "spec#template#spec#containers[0]#volumeMounts",
-                         }
-    volumes_path = {"pod": "spec#volumes",
-                    "dc":  "spec#template#spec#volumes",
-                    "rc":  "spec#template#spec#volumes",
-                   }
+import time
 
-    # pylint allows 5
-    # pylint: disable=too-many-arguments
-    def __init__(self,
-                 kind,
-                 resource_name,
-                 namespace,
-                 vol_name,
-                 mount_path,
-                 mount_type,
-                 secret_name,
-                 claim_size,
-                 claim_name,
-                 kubeconfig='/etc/origin/master/admin.kubeconfig',
-                 verbose=False):
-        ''' Constructor for OCVolume '''
-        super(OCVolume, self).__init__(namespace, kubeconfig)
-        self.kind = kind
-        self.name = resource_name
-        self.namespace = namespace
+class RegistryConfig(object):
+    ''' RegistryConfig is a DTO for the registry.  '''
+    def __init__(self, rname, kubeconfig, registry_options):
+        self.name = rname
         self.kubeconfig = kubeconfig
+        self._registry_options = registry_options
+
+    @property
+    def registry_options(self):
+        ''' return registry options '''
+        return self._registry_options
+
+    def to_option_list(self):
+        ''' return all options as a string'''
+        return RegistryConfig.stringify(self.registry_options)
+
+    @staticmethod
+    def stringify(options):
+        ''' return hash as list of key value pairs '''
+        rval = []
+        for key, data in options.items():
+            if data['include'] and data['value']:
+                rval.append('--%s=%s' % (key.replace('_', '-'), data['value']))
+
+        return rval
+
+class Registry(OpenShiftCLI):
+    ''' Class to wrap the oc command line tools '''
+
+    volume_mount_path = 'spec#template#spec#containers[0]volumesMounts'
+    volume_path = 'spec#template#spec#volumes'
+    env_path = 'spec#template#spec#containers[0]#env'
+
+    def __init__(self,
+                 registry_config,
+                 verbose=False):
+        ''' Constructor for OpenshiftOC
+
+           a registry consists of 3 or more parts
+           - dc/docker-registry
+           - svc/docker-registry
+           - endpoint/docker-registry
+        '''
+        super(Registry, self).__init__('default', registry_config.kubeconfig, verbose)
+        self.svc_ip = None
+        self.rconfig = registry_config
         self.verbose = verbose
-        self.resource = None
+        self.registry_parts = [{'kind': 'dc', 'name': self.rconfig.name},
+                             {'kind': 'svc', 'name': self.rconfig.name},
+                             #{'kind': 'endpoints', 'name': self.rconfig.name},
+                            ]
 
-        self.volume_info = {'secret_name': secret_name,
-                            'name': vol_name,
-                            'type': mount_type,
-                            'path': mount_path,
-                            'claimName': claim_name,
-                            'claimSize': claim_size,
-                           }
+        self.volume_mounts = []
+        self.volumes = []
+        for volume in self.rconfig.registry_options['volume_mounts']['value']:
+            volume_info = {'secret_name': volume.get('secret_name', None),
+                           'name':        volume.get('name', None),
+                           'type':        volume.get('type', None),
+                           'path':        volume.get('path', None),
+                           'claimName':   volume.get('claim_name', None),
+                           'claimSize':   volume.get('claim_size', None),
+                          }
 
-        self.volume, self.volume_mount = Volume.create_volume_structure(self.volume_info)
+            vol, vol_mount = Volume.create_volume_structure(volume_info)
+            self.volumes.append(vol)
+            self.volume_mounts.append(vol_mount)
+
+        self.dconfig = None
+        self.svc = None
+
+    @property
+    def deploymentconfig(self):
+        return self.dconfig
+
+    @deploymentconfig.setter
+    def deploymentconfig(self, config):
+        self.dconfig = config
+
+    @property
+    def service(self):
+        return self.svc
+
+    @service.setter
+    def service(self, config):
+        self.svc = config
 
     def get(self):
-        '''return volume information '''
-        vol = self._get(self.kind, self.name)
-        if vol['returncode'] == 0:
-            if self.kind == 'dc' or self.kind == 'deploymentconfig':
-                self.resource = DeploymentConfig(content=vol['results'][0])
-            else:
-                self.resource = Yedit(content=vol['results'][0])
+        ''' return the self.registry_parts '''
+        self.deploymentconfig = None
+        self.service = None
 
-            vol['results'] = self.resource.get(OCVolume.volumes_path[self.kind]) or []
+        for part in self.registry_parts:
+            result = self._get(part['kind'], rname=part['name'])
+            if result['returncode'] == 0 and part['kind'] == 'dc':
+                self.deploymentconfig = DeploymentConfig(result['results'][0])
+            elif result['returncode'] == 0 and part['kind'] == 'svc':
+                self.service = Yedit(content=result['results'][0])
 
-        return vol
+        return (self.deploymentconfig, self.service)
 
     def exists(self):
-        ''' return true/false whether the volume exists'''
-        return self.resource.exists_volume(self.volume)
+        '''does the object exist?'''
+        self.get()
+        if self.deploymentconfig or self.service:
+            return True
+
+        return False
 
     def delete(self):
-        '''delete a volume '''
-        modified = self.resource.delete_volume_by_name(self.volume, self.volume_mount)
-        if modified:
-            return self._replace_content(self.kind, self.volume_info['name'], self.resource.yaml_dict)
+        '''return all pods '''
+        parts = []
+        for part in self.registry_parts:
+            parts.append(self._delete(part['kind'], part['name']))
 
-        return {'returncode': 0, 'changed': False}
+        return parts
 
-    def put(self):
-        '''place volume into dc '''
-        exist_volume = self.resource.find_volume_by_name(self.volume)
-        # update the volume
-        if not exist_volume:
-            self.resource.add_volume(self.volume, self.volume_mount)
-        else:
-            self.resource.update_volume(self.volume)
-            self.resource.update_volume_mount(self.volume_mount)
+    def prep_registry(self):
+        options = self.rconfig.to_option_list()
 
-        return self._replace_content(self.kind, self.name, self.resource.yaml_dict)
+        cmd = ['registry']
+        cmd.extend(options)
+        cmd.extend(['--dry-run=True', '-o', 'json'])
 
-    def needs_update(self):
-        ''' verify an update is needed '''
-        return self.resource.needs_update_volume(self.volume, self.volume_mount)
+        results = self.openshift_cmd(cmd, oadm=True, output=True, output_type='json')
+        # probably need to parse this
+        if results['returncode'] != 0 and results['results'].has_key('items'):
+            return results
+
+        service = None
+        deploymentconfig = None
+        for obj in results['results']['items']:
+            if obj['kind'] == 'DeploymentConfig':
+                deploymentconfig = DeploymentConfig(obj)
+            elif obj['kind'] == 'Service':
+                service = obj
+
+        # Verify we got a service and a deploymentconfig
+        if not service or not deploymentconfig:
+            return results
+
+        # results will need to get parsed here and modifications added
+        deploymentconfig = self.add_modifications(deploymentconfig)
+
+        # modify service ip
+        if self.svc_ip:
+            service.put('spec#clusterIP', self.svc_ip)
+
+        # need to create the service and the deploymentconfig
+        service_file = Utils.create_file('service', service)
+        deployment_file = Utils.create_file('deploymentconfig', deploymentconfig)
+
+        return [service_file, deployment_file]
+
+    def create(self):
+        '''Create a deploymentconfig
+
+           This can take some time to ensure deployment.
+           TODO: WAIT??
+
+           returns an array of results:
+           result
+             returncode: [0|1|?]
+             stderr: some error message
+             stdout: created successfully
+        '''
+        results = []
+        files = self.prep_registry()
+        if not files:
+            return {'returncode': '1', 'msg': 'An error occured during registry prep'}
+
+        for config in files:
+            results.append(self._create(config))
+
+        return results
+
+    def update(self):
+        '''run update for the registry.  This performs a delete and then create '''
+        # Store the current service IP
+        self.get()
+        if self.deploymentconfig:
+            svcip = self.deploymentconfig.get('spec#clusterIP')
+            if svcip:
+               self.svc_ip = svcip
+
+        parts = self.delete()
+        for part in parts:
+            if part['returncode'] != 0:
+                if part.has_key('stderr') and 'not found' in part['stderr']:
+                    # the object is not there, continue
+                    continue
+
+                # something went wrong
+                return parts
+
+        # Ugly built in sleep here.
+        #time.sleep(10)
+
+        files = self.prep_registry()
+
+        results = []
+        files = self.prep_registry()
+        for config in files:
+            results.append(self._create(config))
+
+        return results
+
+    def add_modifications(self, deploymentconfig):
+        ''' update a deployment config with changes '''
+        # Currently we know that our deployment of a registry requires a few extra modifications
+        # Modification 1
+        # we need specific environment variables to be set
+        for key, value in self.rconfig.registry_options['env_vars']['value'].items():
+            if not deploymentconfig.exists_env_value(key, value):
+            #if self.env_value_exists(yed.get(Registry.env_path), key, value):
+                deploymentconfig.add_env_value(key, value)
+                #self.env_add_value(yed.get(Registry.env_path), key, value)
+            else:
+                deploymentconfig.update_env_var(key, value)
+
+        # Modification 2
+        # we need specific volume variables to be set
+        for volume in self.volumes:
+            deploymentconfig.update_volume(volume)
+
+        for vol_mount in self.volume_mounts:
+            deploymentconfig.update_volume_mount(vol_mount)
+
+        # Modification 3
+        # Edits
+        edit_results = []
+        for key, value in self.rconfig.registry_options['edits']['value'].items():
+            edit_results.append(deploymentconfig.put(key, value))
+
+        if not any([res[0] for res in edit_results]):
+            return None
+
+        # Modification 4
+        # Remove the default mount if we specified mounts
+        if self.volumes:
+            deploymentconfig.delete_volume_by_name({'name': 'registry-storage'})
+
+        return deploymentconfig.yaml_dict
+
+    def needs_update(self, verbose=False):
+        ''' check to see if we need to update '''
+        prep_svc, prep_dc = self.prep_registry()
+
+        if not self.svc or not self.deploymentconfig:
+            return True
+
+        if not Utils.check_def_equal(prep_svc, self.service.yaml_dict):
+            return True
+
+        if not Utils.check_def_equal(prep_dc, self.deploymentconfig.yaml_dict):
+            return True
+
+        return False
+#
+#        user_dc = self.create(dryrun=True, output=True, output_type='raw')
+#        if user_dc['returncode'] != 0:
+#            return user_dc
+#
+        # Since the output from oadm_registry is returned as raw
+        # we need to parse it.  The first line is the stats_password
+        #user_dc_results = user_dc['results'].split('\n')
+        ## stats_password = user_dc_results[0]
+
+        ## Load the string back into json and get the newly created dc
+        #user_dc = json.loads('\n'.join(user_dc_results[1:]))['items'][0]
+
+        ## registry needs some exceptions.
+        ## We do not want to check the autogenerated password for stats admin
+        #if not self.rconfig.registry_options['stats_password']['value']:
+        #    for idx, env_var in enumerate(user_dc['spec']['template']['spec']['containers'][0]['env']):
+        #        if env_var['name'] == 'STATS_PASSWORD':
+        #            env_var['value'] = \
+        #              dc_inmem['results'][0]['spec']['template']['spec']['containers'][0]['env'][idx]['value']
+
+        ## dry-run doesn't add the protocol to the ports section.  We will manually do that.
+        #for idx, port in enumerate(user_dc['spec']['template']['spec']['containers'][0]['ports']):
+        #    if not port.has_key('protocol'):
+        #        port['protocol'] = 'TCP'
+
+        ## These are different when generating
+        #skip = ['dnsPolicy',
+        #        'terminationGracePeriodSeconds',
+        #        'restartPolicy', 'timeoutSeconds',
+        #        'livenessProbe', 'readinessProbe',
+        #        'terminationMessagePath',
+        #        'rollingParams',
+        #       ]
+
+        #return not Utils.check_def_equal(user_dc, dc_inmem['results'][0], skip_keys=skip, debug=verbose)
+'''
+      --credentials='': Path to a .kubeconfig file that will contain the credentials the registry should use to contact the master.
+      --dry-run=false: Check if the registry exists instead of creating.
+      --images='openshift3/ose-${component}:${version}': The image to base this registry on - ${component} will be replaced with --type
+      --labels='docker-registry=default': A set of labels to uniquely identify the registry and its components.
+      --latest-images=false: If true, attempt to use the latest image for the registry instead of the latest release.
+      --mount-host='': If set, the registry volume will be created as a host-mount at this path.
+      --no-headers=false: When using the default output, don't print headers.
+  -o, --output='': Output format. One of: json|yaml|wide|name|go-template=...|go-template-file=...|jsonpath=...|jsonpath-file=... See golang template [http://golang.org/pkg/text/template/#pkg-overview] and jsonpath template [http://releases.k8s.io/HEAD/docs/user-guide/jsonpath.md].
+      --output-version='': Output the formatted object with the given version (default api-version).
+      --ports='5000': A comma delimited list of ports or port pairs to expose on the registry pod. The default is set for 5000.
+      --replicas=1: The replication factor of the registry; commonly 2 when high availability is desired.
+      --selector='': Selector used to filter nodes on deployment. Used to run registries on a specific set of nodes.
+      --service-account='': Name of the service account to use to run the registry pod.
+  -a, --show-all=false: When printing, show all resources (default hide terminated pods.)
+      --sort-by='': If non-empty, sort list types using this field specification.  The field specification is expressed as a JSONPath expression (e.g. 'ObjectMeta.Name'). The field in the API resource specified by this JSONPath expression must be an integer or a string.
+  -t, --template='': Template string or path to template file to use when -o=go-template, -o=go-template-file. The template format is golang templates [http://golang.org/pkg/text/template/#pkg-overview].
+      --type='docker-registry': The registry image to use - if you specify --images this flag may be ignored.
+      --volume='/registry': The volume path to use for registry storage; defaults to /registry which is the default for origin-docker-registry.
+
+Use "oadm options" for a list of global command-line options (applies to all commands).
+
+
+/usr/bin/oadm registry --credentials=/etc/origin/master/openshift-registry.kubeconfig --service-account=registry --images='registry.access.redhat.com/openshift3/ose-${component}:${version}' --selector='type=infra' --replicas=0 -o yaml > /root/registry.yml
+
+'''
 
 def main():
     '''
-    ansible oc module for services
+    ansible oc module for registry
     '''
 
     module = AnsibleModule(
         argument_spec=dict(
-            kubeconfig=dict(default='/etc/origin/master/admin.kubeconfig', type='str'),
             state=dict(default='present', type='str',
-                       choices=['present', 'absent', 'list']),
+                       choices=['present', 'absent']),
             debug=dict(default=False, type='bool'),
-            kind=dict(default='dc', choices=['dc', 'rc', 'pods'], type='str'),
             namespace=dict(default='default', type='str'),
-            vol_name=dict(default=None, type='str'),
-            name=dict(default=None, type='str'),
-            mount_type=dict(default=None,
-                            choices=['emptydir', 'hostpath', 'secret', 'pvc'],
-                            type='str'),
-            mount_path=dict(default=None, type='str'),
-            # secrets require a name
-            secret_name=dict(default=None, type='str'),
-            # pvc requires a size
-            claim_size=dict(default=None, type='str'),
-            claim_name=dict(default=None, type='str'),
+            name=dict(default=None, required=True, type='str'),
+
+            kubeconfig=dict(default='/etc/origin/master/admin.kubeconfig', type='str'),
+            credentials=dict(default='/etc/origin/master/openshift-registry.kubeconfig', type='str'),
+            images=dict(default=None, type='str'),
+            latest_image=dict(default=False, type='bool'),
+            labels=dict(default=None, type='list'),
+            ports=dict(default=['5000'], type='list'),
+            replicas=dict(default=1, type='int'),
+            selector=dict(default=None, type='str'),
+            service_account=dict(default='registry', type='str'),
+            mount_host=dict(default=None, type='str'),
+            registry_type=dict(default='docker-registry', type='str'),
+            template=dict(default=None, type='str'),
+            volume=dict(default='/registry', type='str'),
+            env_vars=dict(default=None, type='dict'),
+            volume_mounts=dict(default=None, type='list'),
+            edits=dict(default=None, type='dict'),
         ),
+        mutually_exclusive=[["registry_type", "images"]],
+
         supports_check_mode=True,
     )
-    oc_volume = OCVolume(module.params['kind'],
-                         module.params['name'],
-                         module.params['namespace'],
-                         module.params['vol_name'],
-                         module.params['mount_path'],
-                         module.params['mount_type'],
-                         # secrets
-                         module.params['secret_name'],
-                         # pvc
-                         module.params['claim_size'],
-                         module.params['claim_name'],
-                         kubeconfig=module.params['kubeconfig'],
-                         verbose=module.params['debug'])
+
+    rconfig = RegistryConfig(module.params['name'],
+                             module.params['kubeconfig'],
+                             {'credentials': {'value': module.params['credentials'], 'include': True},
+                              'default_cert': {'value': None, 'include': True},
+                              'images': {'value': module.params['images'], 'include': True},
+                              'latest_image': {'value': module.params['latest_image'], 'include': True},
+                              'labels': {'value': module.params['labels'], 'include': True},
+                              'ports': {'value': ','.join(module.params['ports']), 'include': True},
+                              'replicas': {'value': module.params['replicas'], 'include': True},
+                              'selector': {'value': module.params['selector'], 'include': True},
+                              'service_account': {'value': module.params['service_account'], 'include': True},
+                              'registry_type': {'value': module.params['registry_type'], 'include': False},
+                              'mount_host': {'value': module.params['mount_host'], 'include': True},
+                              'volume': {'value': module.params['mount_host'], 'include': True},
+                              'template': {'value': module.params['template'], 'include': True},
+                              'env_vars': {'value': module.params['env_vars'], 'include': False},
+                              'volume_mounts': {'value': module.params['volume_mounts'], 'include': False},
+                              'edits': {'value': module.params['edits'], 'include': False},
+                           })
+
+
+    ocregistry = Registry(rconfig)
 
     state = module.params['state']
-
-    api_rval = oc_volume.get()
-
-    #####
-    # Get
-    #####
-    if state == 'list':
-        module.exit_json(changed=False, results=api_rval['results'], state="list")
+    print "Exists"
 
     ########
     # Delete
     ########
     if state == 'absent':
-        if oc_volume.exists():
+        if not ocregistry.exists():
+            module.exit_json(changed=False, state="absent")
 
-            if module.check_mode:
-                module.exit_json(change=False, msg='Would have performed a delete.')
+        if module.check_mode:
+            module.exit_json(change=False, msg='Would have performed a delete.')
 
-            api_rval = oc_volume.delete()
+        api_rval = ocregistry.delete()
+        module.exit_json(changed=True, results=api_rval, state="absent")
 
-            module.exit_json(changed=True, results=api_rval, state="absent")
-        module.exit_json(changed=False, state="absent")
 
     if state == 'present':
         ########
         # Create
         ########
-        if not oc_volume.exists():
+        print "exists?"
+        if not ocregistry.exists():
 
             if module.check_mode:
                 module.exit_json(change=False, msg='Would have performed a create.')
 
-            # Create it here
-            api_rval = oc_volume.put()
-
-            # return the created object
-            api_rval = oc_volume.get()
+            api_rval = ocregistry.create()
 
             if api_rval['returncode'] != 0:
                 module.fail_json(msg=api_rval)
@@ -1022,21 +1265,20 @@ def main():
         ########
         # Update
         ########
-        if oc_volume.needs_update():
-            api_rval = oc_volume.put()
+        if not ocregistry.needs_update():
+            module.exit_json(changed=False, state="present")
 
-            if api_rval['returncode'] != 0:
-                module.fail_json(msg=api_rval)
+        if module.check_mode:
+            module.exit_json(change=False, msg='Would have performed an update.')
 
-            # return the created object
-            api_rval = oc_volume.get()
+        print "UPDATE"
+        api_rval = ocregistry.update()
+        print api_rval
 
-            if api_rval['returncode'] != 0:
-                module.fail_json(msg=api_rval)
+        if api_rval['returncode'] != 0:
+            module.fail_json(msg=api_rval)
 
-            module.exit_json(changed=True, results=api_rval, state="present")
-
-        module.exit_json(changed=False, results=api_rval, state="present")
+        module.exit_json(changed=True, results=api_rval, state="present")
 
     module.exit_json(failed=True,
                      changed=False,
@@ -1046,5 +1288,4 @@ def main():
 # pylint: disable=redefined-builtin, unused-wildcard-import, wildcard-import, locally-disabled
 # import module snippets.  This are required
 from ansible.module_utils.basic import *
-
 main()
