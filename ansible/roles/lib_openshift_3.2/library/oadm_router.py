@@ -1730,6 +1730,9 @@ class RoleBinding(Yedit):
         return None
 
 import time
+class RouterException(Exception):
+    '''Router exception class'''
+    pass
 
 class RouterConfig(OpenShiftCLIConfig):
     ''' RouterConfig is a DTO for the router.  '''
@@ -1759,12 +1762,24 @@ class Router(OpenShiftCLI):
                              #{'kind': 'endpoints', 'name': self.config.name},
                             ]
 
+        self.__router_prep = None
         self.dconfig = None
         self.svc = None
         self._secret = None
         self._serviceaccount = None
         self._rolebinding = None
         self.get()
+
+    @property
+    def router_prep(self):
+        '''prepare the router'''
+        if not self.__router_prep:
+            results = self.prepare_router()
+            if not results:
+                raise RouterException('Could not prepare the router.')
+            self.__router_prep = results
+
+        return self.__router_prep
 
     @property
     def deploymentconfig(self):
@@ -1850,9 +1865,8 @@ class Router(OpenShiftCLI):
 
         return parts
 
-    def create(self, dryrun=False, output=False, output_type='json'):
-        '''Create a deploymentconfig '''
-        # We need to create the pem file
+    def prepare_router(self):
+        '''make necessary preparations for the router'''
         router_pem = '/tmp/router.pem'
         with open(router_pem, 'w') as rfd:
             rfd.write(open(self.config.config_options['cert_file']['value']).read())
@@ -1868,10 +1882,32 @@ class Router(OpenShiftCLI):
 
         cmd = ['router', '-n', self.config.namespace]
         cmd.extend(options)
-        if dryrun:
-            cmd.extend(['--dry-run=True', '-o', 'json'])
+        cmd.extend(['--dry-run=True', '-o', 'json'])
+        create_results = self.openshift_cmd(cmd, oadm=True, output=output, output_type=output_type)
 
-        return self.openshift_cmd(cmd, oadm=True, output=output, output_type=output_type)
+        # inspect what create_results has and create each of the objects from it
+
+
+
+    def create(self, dryrun=False, output=False, output_type='json'):
+        '''Create a deploymentconfig '''
+        # We need to create the pem file
+
+        configs = self.prepare_router()
+
+        results = []
+
+        for conf in configs:
+            results.append(self._create(conf))
+
+        rval = 0
+        for result in results:
+            if results['returncode'] != 0:
+                rval = results['returncode']
+                break
+
+        return {'returncode': rval, 'results': results}
+        #create_results = self.openshift_cmd(cmd, oadm=True, output=output, output_type=output_type)
 
     def update(self):
         '''run update for the router.  This performs a delete and then create '''
