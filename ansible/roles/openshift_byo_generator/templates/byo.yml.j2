@@ -181,7 +181,7 @@ openshift_master_portal_net={{ obg_master_portal_net }}
 
 # StorageClass Parameters
 {% if obg_encrypted_storage | default(false)%}
-openshift_storageclass_parameters={'type': '{{ obg_storageclass_name | default('gp2') }}', 'encrypted': '{{ obg_encrypted_storage | string }}'{% if obg_kmskeyid is defined %}, 'kmsKeyId': '{{ obg_kmskeyid }}'{% endif %}}
+openshift_storageclass_parameters={'type': '{{ obg_storageclass_name | default('gp2') }}', 'encrypted': '{{ obg_encrypted_storage | string }}'{% if obg_kmskeyid is defined and 'omit' not in obg_kmskeyid %}, 'kmsKeyId': '{{ obg_kmskeyid }}'{% endif %}}
 {% endif %}
 
 # Openshift Router
@@ -212,7 +212,7 @@ openshift_hosted_registry_registryurl={{ obg_registry_host }}/{{ obg_registry_te
 openshift_hosted_registry_routehost={{ obg_registry_routehost }}
 openshift_hosted_registry_routecertificates={{ obg_registry_routehost_routecertificates }}
 openshift_hosted_registry_storage_s3_encrypt={{ obg_encrypted_storage }}
-{%   if obg_kmskeyid is defined %}
+{%   if obg_kmskeyid is defined and 'omit' not in obg_kmskeyid %}
 openshift_hosted_registry_storage_s3_kmskeyid={{ obg_kmskeyid }}
 {%   endif %}
 {% else %}
