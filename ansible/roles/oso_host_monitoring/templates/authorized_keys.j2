@@ -1,0 +1,13 @@
+{% for user in osohm_authorized_keys | selectattr('pub_key', 'defined') %}
+{%     if rootlog_stat.stat.exists %}
+command="/usr/bin/rootlog-ssh-wrap {{ user.username }}" {{ user.pub_key }}
+{%     else %}
+{{ user.pub_key }}
+{%     endif %}
+{% endfor %}
+{% for autokey in osohm_authorized_autokeys %}
+from="{{ our_authorized_keys_autokeys_hosts | join(',') }}" {{ autokey | replace('\n', '') }}
+{% endfor %}
+{% for key in our_authorized_keys_extra %}
+{{ key }}
+{% endfor %}

@@ -59,6 +59,12 @@
     openshift_daemonset_config_monitoring: True
     openshift_daemonset_config_image: "{{ osohm_docker_registry_url }}{{ osohm_host_monitoring }}:{{ osohm_environment }}"
     openshift_daemonset_config_monitoring_image: "{{ osohm_docker_registry_url }}{{ osohm_host_monitoring }}:{{ osohm_environment }}"
+
+    openshift_daemonset_config_configmap_files:
+      10_root_profile_d.sh: ../rootlog_ssh_logs/files/10_root_profile_d.sh
+      history.sh: ../rootlog_ssh_logs/files/history.sh
+      session_record.sh: ../rootlog_ssh_logs/files/session_record.sh
+
     openshift_daemonset_config_configmap_contents_to_files:
     - name: monitoring_config.yml
       contents: |
@@ -68,14 +74,15 @@
     - path: /tmp/authorized_keys
       name: authorized_keys
       contents: |
-        {% for user in osohm_authorized_keys | selectattr('pub_key', 'defined') %}
-        {{ user.pub_key }}
-        {% endfor %}
+        {{ lookup('template', '../templates/authorized_keys.j2') }}
     openshift_daemonset_config_configmap_literals:
       etcd_metrics.yml: |
         {{ lookup('file', '../files/etcd_metrics.yml') }}
       container_metrics_config.yml: |
         {{ lookup('file', '../files/container_metrics_config.yml') }}
+
+      root_ssh_wrap.yml: |
+        {{ lookup('file', '../files/rootlog_ssh_wrap.yml') }}
 
       docker_config_tasks.yml: |
           - name: create the openshift_tools directory
@@ -151,6 +158,9 @@
           # setup authorized keys
           - name: Import authorized keys tasks
             import_tasks: /opt/config/authorized_keys_tasks.yml
+
+          - name: Setup rootlog-ssh-wrap
+            import_tasks: /opt/config/root_ssh_wrap.yml
 
           - name: Import docker auth config tasks
             import_tasks: /opt/config/docker_config_tasks.yml
